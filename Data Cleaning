@@ -1,0 +1,201 @@
+# R: Cleaning, EDA, and simple modelling
+# Packages
+install.packages("tidyverse")
+install.packages("janitor")
+install.packages("lubridate")
+install.packages("broom")
+install.packages("readr")
+install.packages("dplyr")
+install.packages("ggplot2")
+install.packages("tidyr")
+
+# ============================
+# HIV VL analysis — clean script
+# ============================
+
+# --- 0) Deconflict any rogue 'rstudio' object & restart-friendly guards ---
+if (exists("rstudio", envir = .GlobalEnv, inherits = FALSE)) {
+  rm("rstudio", envir = .GlobalEnv)
+}
+
+library(readr)
+library(tidyverse)
+library(dplyr)
+library(lubridate)
+library(janitor)
+library(ggplot2)
+library(broom)
+library(tidyr)
+
+# ---- Load data ----
+df <- read_csv("C:\\Users\\User\\Documents\\sample data.csv", show_col_types = FALSE) |>
+  clean_names()
+
+# --- 2) Load data (use / or escaped \\ on Windows) ---
+# Update the path if needed
+data_path <- "C:/Users/User/Documents/sample data.csv"
+
+df <- read_csv(data_path, show_col_types = FALSE) |>
+  clean_names() |>
+  # Coerce obvious numeric-looking columns safely if they came in as chr
+  type_convert()   # lets readr infer ints/dbls where possible
+
+# --- 3) Basic checks & cleaning (robust to mixed types) ---
+# Helper: coerce 0/1/NA reliably from any type
+to_int01 <- function(x) {
+  # Accept logical, numeric, or character "0"/"1"
+  out <- suppressWarnings(as.integer(x))
+  # If coercion produced lots of NAs but x had "0"/"1" strings, try that path
+  if (all(is.na(out)) && is.character(x)) {
+    out <- ifelse(trimws(x) %in% c("1", "TRUE", "true"), 1L,
+                  ifelse(trimws(x) %in% c("0", "FALSE", "false"), 0L, NA_integer_))
+  }
+  out
+}
+
+df <- df |>
+  mutate(
+    # Dates
+    test_date = suppressWarnings(ymd(test_date)),
+    
+    # Categorical
+    gender = factor(gender, levels = c("F", "M")),
+    district = factor(district),
+    
+    # Binary/ordinal numerics
+    hiv_status      = to_int01(hiv_status),
+    art_status      = to_int01(art_status),
+    vl_suppressed   = to_int01(vl_suppressed),
+    income_quintile = suppressWarnings(as.integer(income_quintile)),
+    
+    # Age grouping (allow inclusive lower bound; Inf for safety)
+    age = suppressWarnings(as.numeric(age)),
+    age_group = cut(
+      age,
+      breaks = c(0, 24, 34, 44, Inf),
+      labels = c("<=24", "25-34", "35-44", "45+"),
+      include.lowest = TRUE, right = TRUE
+    )
+  ) |>
+  # Business rule: if not on ART and VL suppressed is NA, set to 0
+  mutate(
+    vl_suppressed = if_else(is.na(vl_suppressed) & art_status == 0L, 0L, vl_suppressed)
+  )
+
+# --- 4) Keep PLHIV for VL outcomes ---
+plhiv <- df |> filter(hiv_status == 1L)
+
+# --- 5) Quick EDA -- ART distribution by district ---
+art_by_dist <- plhiv |>
+  count(district, art_status, name = "n") |>
+  group_by(district) |>
+  mutate(p = n / sum(n)) |>
+  ungroup()
+
+# Print safely (some environments choke on tibble printing)
+print(as.data.frame(art_by_dist))
+
+# --- 6) Plot: VL suppression by district among PLHIV on ART ---
+plot_data <- plhiv |>
+  filter(art_status == 1L) |>
+  group_by(district) |>
+  summarise(vl_supp_rate = mean(vl_suppressed, na.rm = TRUE), .groups = "drop") |>
+  arrange(desc(vl_supp_rate))
+
+if (nrow(plot_data) > 0) {
+  p <- ggplot(plot_data, aes(x = reorder(district, vl_supp_rate), y = vl_supp_rate)) +
+    geom_col() +
+    coord_flip() +
+    labs(
+      title = "Viral Load Suppression by District (PLHIV on ART)",
+      x = "District", y = "Suppression Rate"
+    )
+  print(p)
+} else {
+  message("No rows available for plotting (check art_status or vl_suppressed values).")
+}
+
+# --- 7) Logistic regression: VL suppression (PLHIV on ART) ---
+model_df <- plhiv |>
+  filter(art_status == 1L) |>
+  drop_na(vl_suppressed, gender, age_group, income_quintile, district)
+
+if (nrow(model_df) >= 10 && length(unique(model_df$vl_suppressed)) > 1) {
+  fit <- glm(
+    vl_suppressed ~ gender + age_group + income_quintile + district,
+    data = model_df,
+    family = binomial()
+  )
+  cat("\n=== Logistic regression: VL suppression (ART clients) ===\n")
+  print(summary(fit))
+  
+  or_tbl <- broom::tidy(fit, exponentiate = TRUE, conf.int = TRUE) |>
+    arrange(desc(estimate))
+  print(as.data.frame(or_tbl))
+  
+  # Predicted probabilities by district
+  approx_safe <- function(x, y, xout) {
+    # coerce to numeric & drop NA/Inf
+    x <- suppressWarnings(as.numeric(x))
+    y <- suppressWarnings(as.numeric(y))
+    ok <- is.finite(x) & is.finite(y)
+    x <- x[ok]; y <- y[ok]
+    
+    # need at least two distinct x values to interpolate
+    if (length(x) < 2 || length(unique(x)) < 2) {
+      warning("Not enough valid points to interpolate (need ≥2).")
+      return(NA_real_)
+    }
+    
+    # keep x increasing for approx()
+    ord <- order(x)
+    x <- x[ord]; y <- y[ord]
+    
+    # keep xout within range (or set rule=2 below to extrapolate)
+    xout <- pmin(pmax(xout, min(x)), max(x))
+    
+    approx(x = x, y = y, xout = xout, rule = 2)$y
+  }
+  
+  # Example replacing your call (you had approx(sp$y, sp$x, xout = cutoff)):
+  y_at_cutoff <- approx_safe(sp$y, sp$x, cutoff)
+  
+  
+  model_df <- plhiv |>
+    filter(art_status == 1) |>
+    drop_na(vl_suppressed, gender, age_group, income_quintile, district)
+  
+  if (nrow(model_df) > 10 && length(unique(model_df$vl_suppressed)) == 2) {
+    fit <- glm(
+      vl_suppressed ~ gender + age_group + income_quintile + district,
+      data = model_df,
+      family = binomial()
+    )
+    
+    or_tbl <- broom::tidy(fit, exponentiate = TRUE, conf.int = TRUE) |>
+      arrange(desc(estimate))
+    
+    print(or_tbl)
+  } else {
+    message("⚠️ Model skipped — not enough usable data or outcome has one value only.")
+    or_tbl <- data.frame()  # creates an empty object so no 'not found' error
+  }
+  # Predicted probabilities by district
+  model_df$pred <- predict(fit, type = "response")
+  pred_by_dist <- model_df |>
+    group_by(district) |>
+    summarise(pred_supp_mean = mean(pred), .groups = "drop") |>
+    arrange(desc(pred_supp_mean))
+  print(as.data.frame(pred_by_dist))
+  
+  # Optional: save outputs
+  if (!dir.exists("outputs")) dir.create("outputs")
+  write_csv(or_tbl, "outputs/logistic_or_results.csv")
+  write_csv(pred_by_dist, "outputs/predicted_suppression_by_district.csv")
+} else {
+  message(
+    "Not enough data variation for logistic regression (need ART==1 rows and both 0/1 in vl_suppressed)."
+  )
+}
+
+  
