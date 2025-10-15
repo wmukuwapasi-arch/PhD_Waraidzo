@@ -1,0 +1,17 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Simple SIR model
+beta, gamma = 0.3, 0.1
+S, I, R = [0.99], [0.01], [0]
+
+for t in range(100):
+    new_S = S[-1] - beta * S[-1] * I[-1]
+    new_I = I[-1] + beta * S[-1] * I[-1] - gamma * I[-1]
+    new_R = R[-1] + gamma * I[-1]
+    S.append(new_S); I.append(new_I); R.append(new_R)
+
+plt.plot(S, label='Susceptible')
+plt.plot(I, label='Infected')
+plt.plot(R, label='Recovered')
+plt.legend(); plt.show()
